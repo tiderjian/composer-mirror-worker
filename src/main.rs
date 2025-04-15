@@ -13,9 +13,9 @@ use tokio::io::AsyncWriteExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use clap::Parser;
 
-const PACKAGES_LIST_URL: &str = "https://packagist.org/packages/list.json";
-const CHANGES_URL: &str = "https://packagist.org/metadata/changes.json?since=";
-const PACKAGE_METADATA_URL: &str = "https://packagist.org/p2/";
+const PACKAGES_LIST_URL: &str = "/packages/list.json";
+const CHANGES_URL: &str = "/metadata/changes.json?since=";
+const PACKAGE_METADATA_URL: &str = "/p2/";
 const PUBLIC_PATH: &str = "./public/";
 
 /// Quickly build a composer mirror.
@@ -32,7 +32,15 @@ struct Args {
 
     /// Proxy address
     #[arg(short, long)]
-    proxy: Option<String>
+    proxy: Option<String>,
+
+    /// Update specific package name
+    #[arg(short = 'n', long)]
+    package_name: Option<String>,
+
+    /// 可指定第三方地址，如通过cloudflare代理的加速网址
+    #[arg(short = 'o', long, default_value_t = String::from("https://packagist.org") )]
+    host: String
 }
 
 #[tokio::main]
@@ -46,8 +54,15 @@ async fn main() -> Result<(), anyhow::Error> {
         Some(proxy) => client.proxy(reqwest::Proxy::all(proxy)?).build()?,
         None => client.build()?
     };
-       
 
+    if let Some(package_name) = args.package_name {
+        // Update single package
+        if let Err(e) = update_single_package(&client, &package_name).await {
+            eprintln!("Failed to update package {}: {:?}", package_name, e);
+        }
+        return Ok(());
+    }
+       
     loop {
         let last_modified_time = read_last_modified_time();
         if let Some(last_modified_time) = last_modified_time {
@@ -64,6 +79,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
         thread::sleep(Duration::from_secs(args.interval));
     }
+}
+
+async fn update_single_package(client: &Client, package_name: &str) -> Result<(), anyhow::Error> {
+    println!("Updating package: {}", package_name);
+    fetch_package_metadata(client, package_name).await?;
+    fetch_package_metadata(client, &format!("{}~dev", package_name)).await?;
+    Ok(())
 }
 
 
@@ -125,6 +147,7 @@ async fn fetch_with_retries(client: &Client, url: &str, retries: i32, headers: H
         
         let response_result = client
             .get(url)
+            .timeout(Duration::from_secs(600))
             .headers(headers.clone())
             .send()
             .await;
@@ -142,16 +165,20 @@ async fn fetch_with_retries(client: &Client, url: &str, retries: i32, headers: H
     Err(anyhow::anyhow!("Max retries exceeded"))
 }
 
-async fn full_update(client: &Client) -> Result<(), anyhow::Error> {
-    let args = Args::parse();
-
-    let byt = load_url(PACKAGES_LIST_URL, client).await?;
-
+async fn ungzip(byt: BytesMut) -> Result<Value, anyhow::Error> {
     let mut decoder = GzipDecoder::new(&byt[..]);
     let mut content = String::new();
     decoder.read_to_string(&mut content).await?;
 
-    let response:Value = serde_json::from_str(&content).unwrap();
+    Ok(serde_json::from_str(&content).unwrap())
+}
+
+async fn full_update(client: &Client) -> Result<(), anyhow::Error> {
+    let args = Args::parse();
+
+    let byt = load_url(format!("{}{}", args.host, PACKAGES_LIST_URL).as_str(), client).await?;
+
+    let response:Value = ungzip(byt).await?;
 
     let start = SystemTime::now();
     let duration = start.duration_since(UNIX_EPOCH)?;
@@ -196,8 +223,10 @@ async fn full_update(client: &Client) -> Result<(), anyhow::Error> {
 
 async fn incremental_update(client: &Client, last_modified_time: u64) -> Result<(), anyhow::Error> {
     let args = Args::parse();
-    let url = format!("{}{}", CHANGES_URL, last_modified_time);
-    let response: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    let url = format!("{}{}{}", args.host, CHANGES_URL, last_modified_time);
+    let header = HeaderMap::new();
+    let res = fetch_with_retries(client, &url, 3, header).await?;
+    let response: Value = res.json().await?;
 
     match response["actions"][0]["type"].as_str() {
         Some("resync") => {
@@ -248,12 +277,11 @@ async fn incremental_update(client: &Client, last_modified_time: u64) -> Result<
                 result??;
             }
             
+            if response["timestamp"].is_u64() {
+                save_last_modified_time(response["timestamp"].to_string().as_str());
+            }
         }
         
-    }
-
-    if response["timestamp"].is_u64() {
-        save_last_modified_time(response["timestamp"].to_string().as_str());
     }
     Ok(())
 }
@@ -270,6 +298,7 @@ fn delete_package_metadata(package_name: &str) {
 }
 
 async fn fetch_package_metadata(client: &Client, package_name: &str) -> Result<(), anyhow::Error> {
+    let args = Args::parse();
     let path = format!("{}p2/{}.json", PUBLIC_PATH, package_name);
     let mut headers = HeaderMap::new();
     headers.insert("Accept-Encoding", HeaderValue::from_static("gzip"));
@@ -286,10 +315,18 @@ async fn fetch_package_metadata(client: &Client, package_name: &str) -> Result<(
         
     }
 
-    let response = fetch_with_retries(client, &format!("{}{}.json", PACKAGE_METADATA_URL, package_name), 3, headers).await?;
+    let response = fetch_with_retries(client, &format!("{}{}{}.json", args.host, PACKAGE_METADATA_URL, package_name), 3, headers).await?;
     
     if response.status() == 304 {
         return Ok(());
+    }
+
+    if response.status() != 200 {
+        return Err(anyhow::anyhow!(
+            "Couldn't download URL: {}. Error: {:?}",
+            package_name,
+            response.status(),
+        ));
     }
     
     let path_obj = Path::new(&path);
