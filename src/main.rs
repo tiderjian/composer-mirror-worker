@@ -127,7 +127,7 @@ async fn load_url(url: &str, client: &Client) -> Result<BytesMut, anyhow::Error>
 
     let request = client.get(url)
         .header(header::ACCEPT, "*/*")
-        .header(header::ACCEPT_ENCODING, "gzip, deflate, br")
+        .header(header::ACCEPT_ENCODING, "gzip")
         .header(header::CONNECTION, "keep-alive");
 
     let pb = create_url_load_bar(total_size as u64);
