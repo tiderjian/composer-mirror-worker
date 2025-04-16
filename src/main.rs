@@ -176,12 +176,15 @@ async fn ungzip(byt: BytesMut) -> Result<Value, anyhow::Error> {
 async fn full_update(client: &Client) -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
+    //println!("[MEMORY] Before loading packages list: {:.2} MB", mem_usage_mb());
     let byt = load_url(format!("{}{}", args.host, PACKAGES_LIST_URL).as_str(), client).await?;
-
-    let response:Value = ungzip(byt).await?;
+    //println!("[MEMORY] After loading packages list (compressed): {:.2} MB", mem_usage_mb());
 
     let start = SystemTime::now();
     let duration = start.duration_since(UNIX_EPOCH)?;
+
+    let response:Value = ungzip(byt).await?;
+    //println!("[MEMORY] After ungzipping packages list: {:.2} MB", mem_usage_mb());
 
     let package_names: Vec<String> = match response["packageNames"].as_array() {
         Some(packages) => packages
@@ -191,32 +194,40 @@ async fn full_update(client: &Client) -> Result<(), anyhow::Error> {
         None => vec![],
     };
 
-
     let pb = create_packages_download_bar(package_names.len() as u64);
     let sem = Arc::new(Semaphore::new(args.concurrency));
 
-    let mut tasks = FuturesUnordered::new();
+    // println!("[MEMORY] Package names vector created ({} packages): {:.2} MB", 
+    //     package_names.len(), mem_usage_mb());
 
-    for package_name  in package_names {
-        let sem = Arc::clone(&sem);
-        let client = client.clone();
-        let pb = pb.clone();
+    // 分批处理package_names，每批100个
+    for chunk in package_names.chunks(100) {
+        let mut tasks = FuturesUnordered::new();
+        
+        for package_name in chunk {
+            let sem = Arc::clone(&sem);
+            let client = client.clone();
+            let pb = pb.clone();
 
-        tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await?;
-            fetch_package_metadata(&client, &package_name).await?;
-            fetch_package_metadata(&client, &format!("{}~dev", &package_name).as_str()).await?;
-            pb.inc(1);
+            tasks.push(async move {
+                let _permit = sem.acquire().await?;
+                fetch_package_metadata(&client, package_name).await?;
+                fetch_package_metadata(&client, &format!("{}~dev", package_name)).await?;
+                pb.inc(1);
+                Ok::<(), anyhow::Error>(())
+            });
+        }
 
-            Result::<(), anyhow::Error>::Ok(())
-        }));
-    }
+        // println!("[MEMORY] Before processing batch ({} tasks): {:.2} MB", 
+        //     tasks.len(), mem_usage_mb());
 
-    while let Some(result) = tasks.next().await {
-        result??;
+        while let Some(result) = tasks.next().await {
+            result?;
+        }
+
+        //println!("[MEMORY] After processing batch: {:.2} MB", mem_usage_mb());
     }
     
-
     save_last_modified_time(format!("{}0", duration.as_millis().to_string()).as_str());
     Ok(())
 }
@@ -236,19 +247,16 @@ async fn incremental_update(client: &Client, last_modified_time: u64) -> Result<
             return Ok(());
         },
         _ => {
-
             let actions = response["actions"]
                 .as_array()
                 .cloned() 
                 .unwrap_or_else(Vec::new);
 
             let pb = create_packages_download_bar(actions.len() as u64);
-
             let sem = Arc::new(Semaphore::new(args.concurrency));
 
             let mut tasks = FuturesUnordered::new();
             
-
             for action in actions {
                 let sem = Arc::clone(&sem);
                 let client = client.clone();
@@ -269,8 +277,6 @@ async fn incremental_update(client: &Client, last_modified_time: u64) -> Result<
                     pb.inc(1);
                     Result::<(), anyhow::Error>::Ok(())
                 }));
-
-                
             }
 
             while let Some(result) = tasks.next().await {
@@ -281,7 +287,6 @@ async fn incremental_update(client: &Client, last_modified_time: u64) -> Result<
                 save_last_modified_time(response["timestamp"].to_string().as_str());
             }
         }
-        
     }
     Ok(())
 }
@@ -308,11 +313,9 @@ async fn fetch_package_metadata(client: &Client, package_name: &str) -> Result<(
 
         let system_time = metadata.modified()?;
         let datetime: DateTime<Utc> = DateTime::from(system_time);
-        // 格式化日期时间为 RFC2822 格式
         let formatted_date = datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
         headers.insert("If-Modified-Since", HeaderValue::from_str(&formatted_date)?);
-        
     }
 
     let response = fetch_with_retries(client, &format!("{}{}{}.json", args.host, PACKAGE_METADATA_URL, package_name), 3, headers).await?;
@@ -355,6 +358,17 @@ fn create_packages_download_bar(count: u64) -> ProgressBar{
     let pb = ProgressBar::new(count);
     pb
 }
+
+// fn mem_usage_mb() -> f64 {
+//     if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+//         if let Some(size) = statm.split_whitespace().next() {
+//             if let Ok(pages) = size.parse::<usize>() {
+//                 return (pages * 4096) as f64 / (1024.0 * 1024.0);
+//             }
+//         }
+//     }
+//     0.0
+// }
 
 fn create_url_load_bar(size: u64) -> ProgressBar{
     let pb = ProgressBar::new(size);
